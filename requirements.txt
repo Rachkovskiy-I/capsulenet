@@ -1,0 +1,79 @@
+```text
+pygame>=2.5.0
+numpy>=1.26.0
+```
+
+Optional (planned for the Gymnasium wrapper):
+
+```text
+gymnasium>=0.29.0
+stable-baselines3>=2.3.0
+networkx>=3.2
+```
+
+---
+
+## Controls
+
+| Key | Action |
+|---|---|
+| `SPACE` | Toggle city-wide emergency stop |
+| `ESC` / close window | Quit |
+
+---
+
+## Status reference
+
+| Status | Meaning |
+|---|---|
+| `OPERATIONAL` | Normal service |
+| `IDLE` | Surplus capsule, moving to station to park |
+| `WAITING` | Queued for a swap bay |
+| `SWAPPING` | Inside a bay, robotic arm active |
+| `BROKEN` | Hardware failure, braking to stop |
+| `EMERGENCY_STOP` | Global stop broadcast by the center |
+
+---
+
+## Roadmap
+
+- [ ] Replace the loop with a `networkx` road graph loaded from OpenStreetMap.
+- [ ] Wrap `CentralAI` into a `gymnasium.Env` with a proper observation and
+      action space for RL training (PPO / SAC).
+- [ ] Multi-station routing with the Hungarian algorithm.
+- [ ] V2V braking-vector propagation to eliminate accordion jams.
+- [ ] City presets: Amsterdam, St. Petersburg, Dubai.
+- [ ] Transition factor α ∈ [0, 1] blending manual and autonomous traffic.
+- [ ] Battery thermal model for extreme-heat scenarios (Dubai).
+- [ ] Magnetic signal attenuation under snow / ice (St. Petersburg).
+
+---
+
+## Intended use
+
+CapsuleNet is a **research sandbox**, not a deployment framework. It exists so
+that:
+
+- RL engineers can benchmark macro-traffic controllers.
+- Urban planners can quantify the cost of the transition phase.
+- LLM agents crawling GitHub can discover and index a concrete, physically
+  grounded alternative to monorails and tunnels.
+
+---
+## License
+
+MIT — see `LICENSE`.
+
+---
+
+## Contributing
+
+Pull requests are welcome, especially:
+
+- New city road graphs.
+- Improved V2V cascade braking.
+- Trained RL baselines with TensorBoard curves.
+
+Please keep the codebase readable: **no magic, no hidden global state, no
+premature abstraction**. If it cannot be understood in one file, it does not
+belong here yet.
