@@ -1,31 +1,27 @@
 """
-CapsuleNet — Hybrid AI Simulation Framework for Autonomous Magnetic-Tape
-Urban Transit.
+CapsuleNet — Centrally Orchestrated Tape-Guided Urban Transit.
+
+Data-Oriented Design (DOD) simulation with NetworkX infrastructure and
+vectorized NumPy physics. Designed to sustain 10,000 active capsules at 60 FPS.
 
 Architecture
 ------------
-*   Infrastructure layer: a NetworkX-directed road graph with waypoint-based
-    edges (sub-pixel path resolution) and multiple BatterySwapStation hubs.
-*   Physical layer: Capsule is a *dumb actuator*. It has no onboard computer,
-    no route planning, no strategic logic. Its only local reflexes are a
-    P+I lane-keeping controller reacting to magnetic sensor noise and an
-    immediate V2V emergency-braking response. Physics cannot wait for a
-    network round-trip, so these reflexes live on the capsule.
-*   Intelligence layer: CentralAI is the single source of strategic truth.
-    It performs fleet sizing, demand scheduling, speed-limit broadcasts,
-    route generation (networkx.shortest_path) and dynamic swap-station
-    rerouting.
+*   UrbanGraph       — NetworkX road graph; every directed edge is indexed
+                      0..M-1 with a precomputed waypoint cache (W, 2).
+*   VectorEngine     — the central state matrix (MAX_CAPSULES=10,000) and
+                      the vectorized physics pipeline (no per-capsule loops).
+*   CentralAI        — macro scheduler. Fleet sizing, demand, speeds, routing
+                      via nx.shortest_path, dynamic swap-station dispatch.
+*   Renderer         — bulk blitting via cached sprite + pygame.surfarray.
 
-Dependencies: pygame, networkx, numpy, random, math (stdlib).
-No non-English text anywhere.
+Dependencies: pygame, networkx, numpy.
 """
 
 from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -33,17 +29,69 @@ import pygame
 
 
 # ===========================================================================
-# CONFIGURATION CONSTANTS
+# GLOBAL CONFIG
 # ===========================================================================
 
 WIDTH, HEIGHT = 1200, 800
 FPS = 60
 
+# Fleet
+MAX_CAPSULES = 10_000
+INITIAL_ACTIVE = 2_000
+
+# Physics (per tick at 60 Hz)
+MAX_SPEED = 5.0
+IDLE_SPEED_CAP = 2.5
+WARN_SPEED_FACTOR = 0.4
+NEEDS_SWAP_SPEED_FACTOR = 0.6
+ACCEL = 0.10
+DECEL = 0.20
+
+# Waypoint / tape geometry
+WAYPOINT_STEP = 6.0
+
+# Safety
+SAFE_DISTANCE = 30.0
+WARN_DISTANCE = 60.0
+SAFE_DISTANCE_SQ = SAFE_DISTANCE * SAFE_DISTANCE
+WARN_DISTANCE_SQ = WARN_DISTANCE * WARN_DISTANCE
+
+# Battery
+BATTERY_LOW = 30.0
+BATTERY_CRITICAL = 15.0
+BATTERY_DRAIN_BASE = 0.02
+BATTERY_DRAIN_SPEED = 0.05
+BATTERY_RECHARGE_RATE = 0.6
+SWAP_DURATION_TICKS = 90
+
+# Local PID (lane keeping)
+PID_KP = 0.6
+PID_KI = 0.05
+PID_INT_CLAMP = 1.0
+DRIFT_CLAMP = 3.0
+DRIFT_APPLY = 0.15
+
+# Station
+STATION_CAPACITY = 10
+STATION_RECHARGE_SEC = 6.0
+MAX_STATION_SLOTS = 2
+
+# Scheduling
+TICKS_PER_HOUR = 900
+SCHEDULING_MODE = "DECENTRALIZED"
+
+# Status codes (int8)
+ST_OPERATIONAL   = 0
+ST_IDLE          = 1
+ST_WAITING       = 2
+ST_SWAPPING      = 3
+ST_BROKEN        = 4
+ST_EMERGENCY     = 5
+
 # Palette
 COLOR_BG         = (14, 14, 20)
-COLOR_TAPE       = (70, 82, 120)
-COLOR_TAPE_IDLE  = (44, 50, 70)
-COLOR_NODE       = (180, 180, 200)
+COLOR_TAPE       = (60, 72, 108)
+COLOR_NODE       = (160, 160, 180)
 COLOR_STATION    = (255, 184, 108)
 COLOR_CAPSULE    = (80, 250, 123)
 COLOR_IDLE       = (110, 110, 140)
@@ -53,495 +101,464 @@ COLOR_BROKEN     = (255, 85, 85)
 COLOR_HUD        = (220, 220, 220)
 COLOR_HUD_ALERT  = (255, 100, 100)
 
-# Physics
-SAFE_DISTANCE       = 30.0
-WARN_DISTANCE       = 60.0
-BATTERY_LOW         = 30.0
-BATTERY_CRITICAL    = 15.0
-SWAP_TIME           = 1.5
-STATION_RECHARGE    = 6.0
-MAX_STATION_SLOTS   = 2
-IDLE_SPEED_CAP      = 2.5
-WAYPOINT_STEP       = 6.0     # px between interpolated waypoints along an edge
-
-# PID
-PID_KP              = 0.6
-PID_KI              = 0.05
-PID_CLAMP           = 1.0
-LATERAL_DRIFT_MAX   = 3.0
-
-# Scheduling
-SCHEDULING_MODE     = "DECENTRALIZED"   # or "CLASSIC"
-
 
 # ===========================================================================
-# LAYER 1 — INFRASTRUCTURE
+# LAYER 1 — INFRASTRUCTURE (NetworkX + waypoint cache)
 # ===========================================================================
-
-@dataclass
-class EdgeTape:
-    """
-    A single directed road segment carrying an embedded magnetic tape.
-
-    The tape is represented as a dense sequence of 2D waypoints so capsules
-    can traverse the edge smoothly rather than teleporting between nodes.
-    """
-    u: int
-    v: int
-    waypoints: List[Tuple[float, float]] = field(default_factory=list)
-    length: float = 0.0
-    is_idle_corridor: bool = False   # reserved for future dead-end parking
-
 
 class BatterySwapStation:
-    """
-    Station hub attached to a specific graph node.
+    """Station hub attached to a specific graph node id."""
 
-    Stations own a finite battery pack stock and a per-pack recharge queue.
-    Strategic routing to a station is handled exclusively by CentralAI.
-    """
-
-    def __init__(self, node_id: int, xy: Tuple[float, float], capacity: int = 10):
+    def __init__(self, node_id: int, xy: Tuple[float, float], capacity: int):
         self.node_id = node_id
         self.x, self.y = xy
         self.capacity = capacity
         self.available_batteries = capacity
         self.recharging: List[float] = []
-        self.queue: List["Capsule"] = []
+        self.queue_count = 0          # macro counter — capsules tracked by mask
         self.active_slots = 0
-        # Swap registry: capsules currently inside a swap bay.
-        self.swapping: List["Capsule"] = []
+        self.swap_slots: List[int] = []   # capsule row ids currently swapping
 
     def update(self, dt: float) -> None:
-        """Advance recharge timers and promote ready packs back into stock."""
         still = []
-        for timer in self.recharging:
-            timer -= dt
-            if timer <= 0:
+        for t in self.recharging:
+            t -= dt
+            if t <= 0:
                 if self.available_batteries < self.capacity:
                     self.available_batteries += 1
             else:
-                still.append(timer)
+                still.append(t)
         self.recharging = still
 
-    def request_swap(self, capsule: "Capsule") -> bool:
-        if capsule in self.queue or capsule in self.swapping:
-            return False
-        self.queue.append(capsule)
-        return True
-
-    def try_serve(self, dt: float) -> List["Capsule"]:
-        """Admit new capsules to bays and advance in-progress swaps."""
-        served: List["Capsule"] = []
-
-        while (self.active_slots < MAX_STATION_SLOTS
-               and self.queue
-               and self.available_batteries > 0):
-            cap = self.queue.pop(0)
-            self.available_batteries -= 1
-            self.recharging.append(STATION_RECHARGE)
-            self.active_slots += 1
-            cap.swap_timer = SWAP_TIME
-            cap.status = "SWAPPING"
-            self.swapping.append(cap)
-
-        done = []
-        for cap in self.swapping:
-            cap.swap_timer -= dt
-            if cap.swap_timer <= 0:
-                cap.battery = 100.0
-                cap.needs_swap = False
-                cap.status = "OPERATIONAL"
-                cap.swap_timer = 0.0
-                self.active_slots = max(0, self.active_slots - 1)
-                served.append(cap)
-                done.append(cap)
-        for cap in done:
-            self.swapping.remove(cap)
-        return served
-
     def load_factor(self) -> float:
-        return (len(self.queue) + self.active_slots * 1.5
+        return (self.queue_count + self.active_slots * 1.5
                 - 0.5 * self.available_batteries)
 
 
 class UrbanGraph:
     """
-    Directed NetworkX road graph with waypoint-densified edges.
+    NetworkX road graph with O(1) mapping from edge-index to waypoint cache.
 
-    Node positions are 2D pixel coordinates. Every edge is pre-processed into
-    an EdgeTape carrying a dense waypoint list, length and unit-segment cache.
+    edge_id -> (u, v)
+    waypoint_cache[eid] -> np.ndarray (W, 2) float32
+    edge_length_px[eid] -> float
     """
 
     def __init__(self):
         self.graph: nx.DiGraph = nx.DiGraph()
-        self.edge_tapes: dict[Tuple[int, int], EdgeTape] = {}
-        self.stations: dict[int, BatterySwapStation] = {}
+        self.edges: List[Tuple[int, int]] = []
+        self.edge_to_id: Dict[Tuple[int, int], int] = {}
+        self.station_nodes: Dict[int, BatterySwapStation] = {}
+
         self._build_synthetic_city()
+
+        # ---- Waypoint caches per edge ----
+        self.edge_waypoints: List[np.ndarray] = []
+        self.edge_len_px: np.ndarray = np.zeros(len(self.edges), dtype=np.float32)
+        self._build_waypoint_caches()
 
     # ------------------------------------------------------------------ build
 
     def _build_synthetic_city(self) -> None:
-        """
-        Construct a synthetic but non-trivial urban grid:
-          *  6 columns × 4 rows of intersections
-          *  Random missing links (dead ends, forks, one-ways)
-          *  3 swap stations placed at distinct junctions
-        """
         rng = random.Random(20240101)
-
         cols, rows = 6, 4
-        margin_x, margin_y = 120, 120
-        step_x = (WIDTH - 2 * margin_x) / (cols - 1)
-        step_y = (HEIGHT - 2 * margin_y) / (rows - 1)
+        mx, my = 120, 120
+        sx = (WIDTH - 2 * mx) / (cols - 1)
+        sy = (HEIGHT - 2 * my) / (rows - 1)
 
-        node_id = 0
-        grid: dict[Tuple[int, int], int] = {}
+        nid = 0
+        grid: Dict[Tuple[int, int], int] = {}
         for r in range(rows):
             for c in range(cols):
-                x = margin_x + c * step_x
-                y = margin_y + r * step_y
-                # Small deterministic jitter for organic feel
-                x += rng.uniform(-18, 18)
-                y += rng.uniform(-18, 18)
-                self.graph.add_node(node_id, x=x, y=y)
-                grid[(r, c)] = node_id
-                node_id += 1
+                x = mx + c * sx + rng.uniform(-18, 18)
+                y = my + r * sy + rng.uniform(-18, 18)
+                self.graph.add_node(nid, x=x, y=y)
+                grid[(r, c)] = nid
+                nid += 1
 
-        # Connect horizontally and vertically with some missing links
         for r in range(rows):
             for c in range(cols - 1):
-                if rng.random() < 0.9:
-                    u, v = grid[(r, c)], grid[(r, c + 1)]
-                    self._add_edge_pair(u, v, bidirectional=True)
+                if rng.random() < 0.90:
+                    self._add_pair(grid[(r, c)], grid[(r, c + 1)])
         for r in range(rows - 1):
             for c in range(cols):
                 if rng.random() < 0.85:
-                    u, v = grid[(r, c)], grid[(r + 1, c)]
-                    self._add_edge_pair(u, v, bidirectional=True)
+                    self._add_pair(grid[(r, c)], grid[(r + 1, c)])
 
-        # Add two long diagonal "express" corridors
-        self._add_edge_pair(grid[(0, 0)], grid[(rows - 1, cols - 1)], bidirectional=False)
-        self._add_edge_pair(grid[(0, cols - 1)], grid[(rows - 1, 0)], bidirectional=False)
+        # Express diagonals
+        self._add_pair(grid[(0, 0)], grid[(rows - 1, cols - 1)], bi=False)
+        self._add_pair(grid[(0, cols - 1)], grid[(rows - 1, 0)], bi=False)
 
-        # Ensure strong connectivity by adding a fallback ring if needed
+        # Fallback ring for weak connectivity
         if not nx.is_weakly_connected(self.graph):
             nodes = list(self.graph.nodes)
             for i in range(len(nodes)):
-                u, v = nodes[i], nodes[(i + 1) % len(nodes)]
-                self._add_edge_pair(u, v, bidirectional=True)
+                self._add_pair(nodes[i], nodes[(i + 1) % len(nodes)])
 
-        # ---- Stations at three distinct junctions ----
+        # Three stations at distinct junctions
         station_nodes = [
             grid[(0, 0)],
             grid[(rows - 1, cols - 1)],
             grid[(rows // 2, cols // 2)],
         ]
-        for nid in station_nodes:
-            xy = (self.graph.nodes[nid]["x"], self.graph.nodes[nid]["y"])
-            self.stations[nid] = BatterySwapStation(nid, xy, capacity=10)
+        for s in station_nodes:
+            xy = (self.graph.nodes[s]["x"], self.graph.nodes[s]["y"])
+            self.station_nodes[s] = BatterySwapStation(s, xy, STATION_CAPACITY)
 
-        # Precompute edge tapes (waypoints) for all edges
-        self._build_edge_tapes()
+        # Build the flat edge list + index
+        self.edges = list(self.graph.edges)
+        for i, e in enumerate(self.edges):
+            self.edge_to_id[e] = i
 
-    def _add_edge_pair(self, u: int, v: int, bidirectional: bool) -> None:
-        if self.graph.has_edge(u, v):
-            return
-        self.graph.add_edge(u, v)
-        if bidirectional and not self.graph.has_edge(v, u):
+    def _add_pair(self, u: int, v: int, bi: bool = True) -> None:
+        if not self.graph.has_edge(u, v):
+            self.graph.add_edge(u, v)
+        if bi and not self.graph.has_edge(v, u):
             self.graph.add_edge(v, u)
 
-    def _build_edge_tapes(self) -> None:
-        """Populate `edge_tapes` with dense waypoint lists per directed edge."""
-        for u, v in self.graph.edges:
+    def _build_waypoint_caches(self) -> None:
+        for (u, v) in self.edges:
             xu, yu = self.graph.nodes[u]["x"], self.graph.nodes[u]["y"]
             xv, yv = self.graph.nodes[v]["x"], self.graph.nodes[v]["y"]
             dist = math.hypot(xv - xu, yv - yu)
-            n_steps = max(2, int(dist / WAYPOINT_STEP))
-            pts = [
-                (xu + (xv - xu) * t / n_steps,
-                 yu + (yv - yu) * t / n_steps)
-                for t in range(n_steps + 1)
-            ]
-            self.edge_tapes[(u, v)] = EdgeTape(u, v, pts, dist)
+            n = max(2, int(dist / WAYPOINT_STEP))
+            t = np.linspace(0.0, 1.0, n + 1, dtype=np.float32)
+            xs = xu + (xv - xu) * t
+            ys = yu + (yv - yu) * t
+            self.edge_waypoints.append(
+                np.stack([xs, ys], axis=1).astype(np.float32)
+            )
+            self.edge_len_px[len(self.edge_waypoints) - 1] = float(n)
 
-    # ----------------------------------------------------------------- helpers
+    # --------------------------------------------------------------- lookup
 
     def node_xy(self, nid: int) -> Tuple[float, float]:
         n = self.graph.nodes[nid]
         return n["x"], n["y"]
 
-    def nearest_station_node(self, x: float, y: float) -> Optional[int]:
-        if not self.stations:
-            return None
-        return min(
-            self.stations.keys(),
-            key=lambda nid: (self.node_xy(nid)[0] - x) ** 2
-                            + (self.node_xy(nid)[1] - y) ** 2,
-        )
+    def edge_start_node(self, eid: int) -> int:
+        return self.edges[eid][0]
 
-    def all_station_nodes(self) -> List[int]:
-        return list(self.stations.keys())
+    def edge_end_node(self, eid: int) -> int:
+        return self.edges[eid][1]
+
+    def edge_id(self, u: int, v: int) -> Optional[int]:
+        return self.edge_to_id.get((u, v))
+
+    def station_node_list(self) -> List[int]:
+        return list(self.station_nodes.keys())
 
 
 # ===========================================================================
-# LAYER 2 — PHYSICAL (Capsule = dumb actuator)
+# LAYER 2 — VECTORIZED PHYSICS (Data-Oriented State Matrix)
 # ===========================================================================
 
-class Capsule:
+class VectorEngine:
     """
-    A dumb physical actuator following a tape.
+    Central state matrix + vectorized physics pipeline.
 
-    The capsule receives a *route* (list of node ids) from CentralAI and
-    traverses it. It performs only two local computations:
-      *  P+I lane-keeping against magnetic sensor noise.
-      *  V2V emergency braking against the closest capsule ahead on the
-         same edge.
-
-    It owns no route planning, no fleet logic, no traffic cognition.
-    """
-
-    __slots__ = (
-        "id", "x", "y", "speed", "max_speed", "battery",
-        "battery_consumption_rate", "route", "route_step",
-        "current_edge", "waypoint_idx", "lateral_drift", "pid_integral",
-        "sensor_offset", "is_broken", "needs_swap", "swap_timer",
-        "status", "leading_gap", "reserved_station", "spawn_edge",
-    )
-
-    OPERATIONAL    = "OPERATIONAL"
-    IDLE           = "IDLE"
-    WAITING        = "WAITING"
-    SWAPPING       = "SWAPPING"
-    BROKEN         = "BROKEN"
-    EMERGENCY_STOP = "EMERGENCY_STOP"
-
-    def __init__(self, cid: int, x: float, y: float,
-                 route: List[int], spawn_edge: Tuple[int, int]):
-        self.id = cid
-        self.x, self.y = x, y
-        self.speed = 0.5
-        self.max_speed = 5.0
-        self.battery = 100.0
-        self.battery_consumption_rate = 0.05
-
-        # Route assigned by CentralAI: sequence of node ids. The capsule
-        # follows edge (route[i], route[i+1]).
-        self.route = route
-        self.route_step = 0
-        self.current_edge: Optional[Tuple[int, int]] = spawn_edge
-        self.waypoint_idx = 0
-        self.spawn_edge = spawn_edge
-
-        # Local reflex state
-        self.lateral_drift = 0.0
-        self.pid_integral = 0.0
-        self.sensor_offset = 0.0
-        self.leading_gap = float("inf")
-
-        # Status / fleet flags
-        self.is_broken = False
-        self.needs_swap = False
-        self.swap_timer = 0.0
-        self.status = self.OPERATIONAL
-        self.reserved_station: Optional[int] = None
-
-    # ------------------------------------------------------------- local PID
-
-    def _pid_lane_keeping(self) -> float:
-        """P+I controller returning a lateral correction in [-1, 1]."""
-        self.pid_integral += self.sensor_offset
-        self.pid_integral = max(-PID_CLAMP, min(PID_CLAMP, self.pid_integral))
-        return -(PID_KP * self.sensor_offset + PID_KI * self.pid_integral)
-
-    # ------------------------------------------------------------ V2V reflex
-
-    def _compute_leading_gap(self, all_capsules: List["Capsule"]) -> float:
-        """
-        Scan for the closest capsule ahead on the same *current edge*.
-        Distance is measured in pixel space; only capsules within a lateral
-        corridor of ±20 px from our heading are considered.
-        """
-        if self.current_edge is None:
-            return float("inf")
-
-        # Forward direction of the current edge
-        pts = CAPSULE_WORLD.edge_tapes[self.current_edge].waypoints
-        if self.waypoint_idx >= len(pts) - 1:
-            tx, ty = pts[-1]
-        else:
-            tx, ty = pts[self.waypoint_idx + 1]
-        fx, fy = tx - self.x, ty - self.y
-        flen = math.hypot(fx, fy) or 1.0
-        fx, fy = fx / flen, fy / flen
-
-        min_gap = float("inf")
-        for other in all_capsules:
-            if other is self or other.current_edge != self.current_edge:
-                continue
-            dx, dy = other.x - self.x, other.y - self.y
-            forward = dx * fx + dy * fy
-            if forward <= 0:
-                continue
-            lateral = abs(dx * (-fy) + dy * fx)
-            if lateral > 20:
-                continue
-            dist = math.hypot(dx, dy)
-            if dist < min_gap:
-                min_gap = dist
-        return min_gap
-
-    # ------------------------------------------------------------ main update
-
-    def update(self,
-               central_signals: dict,
-               emergency: bool,
-               all_capsules: List["Capsule"],
-               graph: UrbanGraph,
-               dt: float = 1.0) -> None:
-        # 0. Parked states
-        if self.status in (self.SWAPPING, self.WAITING):
-            self.speed = 0.0
-            return
-
-        # 1. Emergency / hardware failure
-        if self.is_broken or emergency:
-            self.speed = max(0.0, self.speed - 0.2)
-            self.status = self.BROKEN if self.is_broken else self.EMERGENCY_STOP
-            return
-
-        # 2. Target speed from CentralAI
-        target_speed = central_signals.get("recommended_speed", self.max_speed)
-        if self.status == self.IDLE:
-            target_speed = min(target_speed, IDLE_SPEED_CAP)
-        elif self.needs_swap:
-            target_speed = min(target_speed, self.max_speed * 0.6)
-
-        # 3. Battery drain
-        if self.status == self.OPERATIONAL:
-            self.battery -= self.battery_consumption_rate * (
-                self.speed / self.max_speed + 0.5)
-            if self.battery < BATTERY_LOW:
-                self.needs_swap = True
-
-        # 4. V2V emergency braking reflex (does not wait for CentralAI)
-        self.leading_gap = self._compute_leading_gap(all_capsules)
-        if self.leading_gap < SAFE_DISTANCE:
-            target_speed = 0.0
-        elif self.leading_gap < WARN_DISTANCE:
-            target_speed = min(target_speed, self.max_speed * 0.4)
-
-        # 5. Smooth accel / decel
-        if self.speed < target_speed:
-            self.speed = min(self.speed + 0.1, target_speed)
-        elif self.speed > target_speed:
-            self.speed = max(self.speed - 0.2, target_speed)
-
-        # 6. Motion along edge waypoints
-        if self.current_edge is None or self.speed <= 0:
-            return
-
-        tape = graph.edge_tapes[self.current_edge]
-        pts = tape.waypoints
-
-        remaining = self.speed
-        while remaining > 0 and self.waypoint_idx < len(pts) - 1:
-            tx, ty = pts[self.waypoint_idx + 1]
-            dx, dy = tx - self.x, ty - self.y
-            dist = math.hypot(dx, dy)
-
-            if dist <= remaining:
-                self.x, self.y = tx, ty
-                remaining -= dist
-                self.waypoint_idx += 1
-            else:
-                nx_, ny_ = dx / dist, dy / dist
-                self.x += nx_ * remaining
-                self.y += ny_ * remaining
-
-                # Sensor noise + PID lateral drift
-                self.sensor_offset = random.uniform(-0.1, 0.1)
-                self.lateral_drift += self.sensor_offset * 0.5
-                self.lateral_drift += self._pid_lane_keeping()
-                self.lateral_drift = max(-LATERAL_DRIFT_MAX,
-                                         min(LATERAL_DRIFT_MAX, self.lateral_drift))
-
-                perp_x, perp_y = -ny_, nx_
-                self.x += perp_x * self.lateral_drift * 0.15
-                self.y += perp_y * self.lateral_drift * 0.15
-                remaining = 0.0
-
-        # 7. Reached end of current edge -> advance to next route segment
-        if self.waypoint_idx >= len(pts) - 1 and self.route_step + 1 < len(self.route):
-            self.route_step += 1
-            u, v = self.route[self.route_step], self.route[self.route_step + 1]
-            if graph.graph.has_edge(u, v):
-                self.current_edge = (u, v)
-                self.waypoint_idx = 0
-
-    # ---------------------------------------------------------------- render
-
-    def draw(self, screen: pygame.Surface, highlight: bool = False) -> None:
-        if self.status in (self.BROKEN, self.EMERGENCY_STOP):
-            color = COLOR_BROKEN
-        elif self.status == self.IDLE:
-            color = COLOR_IDLE
-        elif self.status == self.WAITING:
-            color = COLOR_WAITING
-        elif self.status == self.SWAPPING:
-            color = COLOR_SWAPPING
-        elif self.needs_swap:
-            color = (241, 250, 140)
-        else:
-            color = COLOR_CAPSULE
-
-        pygame.draw.circle(screen, color, (int(self.x), int(self.y)), 5)
-
-        if highlight:
-            font = pygame.font.SysFont("consolas", 16)
-            tag = font.render(
-                f"#{self.id} {self.status} Bat:{int(self.battery)}%",
-                True, (255, 255, 255)
-            )
-            screen.blit(tag, (self.x - 60, self.y - 24))
-
-
-# Global reference so Capsule can read the road graph without a long
-# parameter chain. Set once in main().
-CAPSULE_WORLD: UrbanGraph = None  # type: ignore
-
-
-# ===========================================================================
-# LAYER 3 — INTELLIGENCE (CentralAI)
-# ===========================================================================
-
-class CentralAI:
-    """
-    Sole strategic authority.
-
-    Owns:
-      *  Demand schedule (CLASSIC vs DECENTRALIZED).
-      *  Fleet sizing and depot spawning.
-      *  Route generation via networkx.shortest_path.
-      *  Dynamic rerouting to swap stations based on load factor.
-      *  Global speed-limit broadcast.
+    All per-capsule physics runs on contiguous NumPy arrays of size
+    MAX_CAPSULES. No Python loop ever touches individual rows in the
+    frame update; only boolean masks + fancy indexing.
     """
 
     def __init__(self, graph: UrbanGraph):
         self.graph = graph
+        self.n = MAX_CAPSULES
+        M = len(graph.edges)
+
+        # ---- Kinematic state ----
+        self.x           = np.zeros(self.n, dtype=np.float32)
+        self.y           = np.zeros(self.n, dtype=np.float32)
+        self.speed       = np.zeros(self.n, dtype=np.float32)
+        self.target      = np.zeros(self.n, dtype=np.float32)
+        self.edge_idx    = np.zeros(self.n, dtype=np.int32)
+        self.wp_idx      = np.zeros(self.n, dtype=np.int32)
+
+        # ---- Battery / status ----
+        self.battery       = np.full(self.n, 100.0, dtype=np.float32)
+        self.needs_swap    = np.zeros(self.n, dtype=np.int8)
+        self.status        = np.zeros(self.n, dtype=np.int8)
+        self.swap_timer    = np.zeros(self.n, dtype=np.int32)
+
+        # ---- Local PID scratch ----
+        self.sensor_offset = np.zeros(self.n, dtype=np.float32)
+        self.pid_integral  = np.zeros(self.n, dtype=np.float32)
+        self.drift         = np.zeros(self.n, dtype=np.float32)
+
+        # ---- V2V scratch ----
+        self.gap_sq        = np.full(self.n, np.inf, dtype=np.float32)
+
+        # ---- Routing (route chains) ----
+        # We store, per capsule, its current target station or destination node.
+        # At each junction CentralAI rewrites edge_idx and wp_idx.
+        self.dest_node     = np.full(self.n, -1, dtype=np.int32)
+        self.reserved_station = np.full(self.n, -1, dtype=np.int32)
+
+        # ---- Bookkeeping ----
+        self.active_mask   = np.zeros(self.n, dtype=np.int8)
+        self.next_free_row = 0
+        self.rng           = np.random.default_rng(0xC0FFEE)
+
+        # ---- Precomputed edge constants as flat arrays for O(1) lookup ----
+        self.edge_wp_count = np.array(
+            [wp.shape[0] for wp in graph.edge_waypoints], dtype=np.int32
+        )
+        # Concatenated waypoint buffer + per-edge offset for flat indexing
+        offsets = [0]
+        for wp in graph.edge_waypoints:
+            offsets.append(offsets[-1] + wp.shape[0])
+        self.wp_offsets = np.array(offsets, dtype=np.int32)
+        self.wp_flat = np.concatenate(graph.edge_waypoints, axis=0).astype(np.float32)
+
+        # Scratch buffers reused each tick
+        self._scratch_bool   = np.zeros(self.n, dtype=bool)
+        self._scratch_i32    = np.zeros(self.n, dtype=np.int32)
+        self._scratch_f32    = np.zeros(self.n, dtype=np.float32)
+
+    # ------------------------------------------------------------ activation
+
+    def activate_row(self, i: int, edge_id: int, wp_start: int = 0) -> None:
+        """Initialize a fresh capsule row at (edge_id, wp_start)."""
+        wp = self.graph.edge_waypoints[edge_id]
+        wp_start = int(np.clip(wp_start, 0, wp.shape[0] - 1))
+        x, y = wp[wp_start]
+        self.x[i] = x
+        self.y[i] = y
+        self.speed[i] = 1.0
+        self.target[i] = MAX_SPEED
+        self.edge_idx[i] = edge_id
+        self.wp_idx[i] = wp_start
+        self.battery[i] = 100.0
+        self.needs_swap[i] = 0
+        self.status[i] = ST_OPERATIONAL
+        self.swap_timer[i] = 0
+        self.sensor_offset[i] = 0.0
+        self.pid_integral[i] = 0.0
+        self.drift[i] = 0.0
+        self.dest_node[i] = -1
+        self.reserved_station[i] = -1
+        self.active_mask[i] = 1
+
+    def deactivate_row(self, i: int) -> None:
+        self.active_mask[i] = 0
+        self.status[i] = ST_OPERATIONAL
+
+    # --------------------------------------------------------------- physics
+
+    def step(self, central_signals: dict, dt: float = 1.0) -> None:
+        """
+        One vectorized physics tick. No Python loops over capsules.
+        CentralAI may rewrite edge_idx / wp_idx after this call via the
+        junction gateway.
+        """
+        act = self.active_mask.astype(bool)  # bool mask for boolean indexing
+
+        # ---------------------------------------------------------------
+        # 1. Target speed base
+        # ---------------------------------------------------------------
+        base = central_signals.get("recommended_speed", MAX_SPEED)
+        self.target[:] = base
+
+        # IDLE rows slow down
+        idle = act & (self.status == ST_IDLE)
+        np.minimum(self.target, IDLE_SPEED_CAP, out=self.target, where=idle)
+
+        # Low-battery rows slow down
+        low = act & (self.needs_swap == 1)
+        scaled = (self.target * NEEDS_SWAP_SPEED_FACTOR).astype(np.float32)
+        self.target = np.where(low, scaled, self.target).astype(np.float32)
+
+        # Emergency / broken rows -> target 0
+        em = act & ((self.status == ST_BROKEN) | (self.status == ST_EMERGENCY))
+        self.target[em] = 0.0
+
+        # Parked rows (WAITING / SWAPPING) -> speed 0, target 0
+        parked = act & ((self.status == ST_WAITING) | (self.status == ST_SWAPPING))
+        self.speed[parked] = 0.0
+        self.target[parked] = 0.0
+
+        # ---------------------------------------------------------------
+        # 2. Battery drain (only OPERATIONAL rows)
+        # ---------------------------------------------------------------
+        op = act & (self.status == ST_OPERATIONAL)
+        sr = (self.speed / MAX_SPEED).astype(np.float32)
+        drain = (BATTERY_DRAIN_BASE + BATTERY_DRAIN_SPEED * sr).astype(np.float32)
+        # Only apply to operational rows
+        np.subtract(self.battery, np.where(op, drain, 0.0).astype(np.float32),
+                    out=self.battery)
+        np.clip(self.battery, 0.0, 100.0, out=self.battery)
+
+        # Flag rows that need a swap
+        low_bat = op & (self.battery < BATTERY_LOW)
+        self.needs_swap[low_bat] = 1
+
+        # ---------------------------------------------------------------
+        # 3. V2V safety reflex (vectorized, per edge)
+        # ---------------------------------------------------------------
+        self._compute_gaps_v2v(act)
+
+        hard = act & (self.gap_sq < SAFE_DISTANCE_SQ)
+        warn = act & (self.gap_sq >= SAFE_DISTANCE_SQ) & (self.gap_sq < WARN_DISTANCE_SQ)
+        self.target[hard] = 0.0
+        self.target[warn] = np.minimum(
+            self.target[warn], (MAX_SPEED * WARN_SPEED_FACTOR)
+        ).astype(np.float32)
+
+        # ---------------------------------------------------------------
+        # 4. Kinematics (accel / decel + speed integration)
+        # ---------------------------------------------------------------
+        # Accel branch
+        acc = act & (self.speed < self.target)
+        self.speed[acc] = np.minimum(self.speed[acc] + ACCEL, self.target[acc])
+        # Decel branch
+        dec = act & (self.speed > self.target)
+        self.speed[dec] = np.maximum(self.speed[dec] - DECEL, self.target[dec])
+        np.clip(self.speed, 0.0, MAX_SPEED, out=self.speed)
+
+        # ---------------------------------------------------------------
+        # 5. Waypoint advance: wp_idx += round(speed * dt)
+        #    Capsules may advance by more than one waypoint per tick.
+        # ---------------------------------------------------------------
+        step = np.rint(self.speed * dt).astype(np.int32)
+        self.wp_idx = np.where(act, self.wp_idx + step, self.wp_idx).astype(np.int32)
+
+        # Clamp wp_idx against per-edge waypoint count; values >= count signal
+        # "junction reached" and will be handled by the CentralAI gateway.
+        max_wp = self.edge_wp_count[self.edge_idx]
+        # Do NOT clamp here — the gateway needs the overflow to detect arrival.
+
+        # ---------------------------------------------------------------
+        # 6. Position lookup: flat index into wp_flat
+        # ---------------------------------------------------------------
+        wp_lookup = np.clip(self.wp_idx, 0, max_wp - 1)
+        flat = self.wp_offsets[self.edge_idx] + wp_lookup
+        pos = self.wp_flat[flat]         # (n, 2)
+        self.x = pos[:, 0].copy()
+        self.y = pos[:, 1].copy()
+
+        # ---------------------------------------------------------------
+        # 7. Hall sensor noise + PID lateral drift
+        # ---------------------------------------------------------------
+        noise = self.rng.normal(0.0, 0.08, size=self.n).astype(np.float32)
+        self.sensor_offset = np.where(act, noise, 0.0).astype(np.float32)
+
+        self.pid_integral[act] += self.sensor_offset[act]
+        np.clip(self.pid_integral, -PID_INT_CLAMP, PID_INT_CLAMP,
+                out=self.pid_integral)
+
+        pid_out = (-(PID_KP * self.sensor_offset
+                     + PID_KI * self.pid_integral)).astype(np.float32)
+        self.drift = np.where(
+            act,
+            self.drift + self.sensor_offset * 0.5 + pid_out,
+            0.0
+        ).astype(np.float32)
+        np.clip(self.drift, -DRIFT_CLAMP, DRIFT_CLAMP, out=self.drift)
+
+        # Perpendicular offset: rotate the local direction of travel by 90°
+        # We approximate the direction using a finite difference along wp_flat.
+        next_flat = np.clip(flat + 1, 0, self.wp_flat.shape[0] - 1)
+        nxt = self.wp_flat[next_flat]
+        dx = nxt[:, 0] - self.x
+        dy = nxt[:, 1] - self.y
+        norm = np.hypot(dx, dy)
+        norm[norm < 1e-5] = 1.0
+        px = -dy / norm
+        py = dx / norm
+        self.x = self.x + px * self.drift * DRIFT_APPLY
+        self.y = self.y + py * self.drift * DRIFT_APPLY
+
+        # ---------------------------------------------------------------
+        # 8. Swap timers (vectorized)
+        # ---------------------------------------------------------------
+        swapping = act & (self.status == ST_SWAPPING)
+        self.swap_timer[swapping] -= 1
+        done = swapping & (self.swap_timer <= 0)
+        self.status[done] = ST_OPERATIONAL
+        self.battery[done] = 100.0
+        self.needs_swap[done] = 0
+        self.reserved_station[done] = -1
+
+    # ------------------------------------------------------------- V2V gaps
+
+    def _compute_gaps_v2v(self, act: np.ndarray) -> None:
+        """
+        Vectorized leading-gap computation.
+
+        Approach: for each edge, gather capsule indices sharing that edge,
+        sort them by wp_idx, compute the squared distance between consecutive
+        capsules, and scatter the result back to gap_sq. This is O(N log N)
+        globally but only O(k log k) per edge with small k in practice.
+        """
+        self.gap_sq.fill(np.inf)
+
+        if not np.any(act):
+            return
+
+        # Group active rows by edge_idx
+        active_rows = np.flatnonzero(act)
+        if active_rows.size == 0:
+            return
+
+        edges_of_active = self.edge_idx[active_rows]
+        # Sort by (edge, wp_idx) — a single vectorized lexsort pass
+        wp_of_active = self.wp_idx[active_rows]
+        order = np.lexsort((wp_of_active, edges_of_active))
+        sorted_rows = active_rows[order]
+        sorted_edges = edges_of_active[order]
+        sorted_wp = wp_of_active[order]
+
+        # Boundaries between edges
+        # edge changes: keep only pairs where the current edge equals the next
+        if sorted_rows.size >= 2:
+            same_edge = sorted_edges[:-1] == sorted_edges[1:]
+            lead_rows = sorted_rows[:-1][same_edge]
+            trail_rows = sorted_rows[1:][same_edge]
+
+            dx = self.x[lead_rows] - self.x[trail_rows]
+            dy = self.y[lead_rows] - self.y[trail_rows]
+            gap_sq = dx * dx + dy * dy
+
+            # Scatter back — write per trailing row (no duplicates by design)
+            self.gap_sq[trail_rows] = gap_sq.astype(np.float32)
+
+    # ------------------------------------------------------------ render data
+
+    def active_xy_status(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (x, y, status) slices for active rows (bulk render)."""
+        mask = self.active_mask.astype(bool)
+        return self.x[mask], self.y[mask], self.status[mask]
+
+    def active_count(self) -> int:
+        return int(self.active_mask.sum())
+
+
+# ===========================================================================
+# LAYER 3 — CENTRAL AI (Strategic Only)
+# ===========================================================================
+
+class CentralAI:
+    """
+    Sole strategic authority. Operates on the engine's NumPy state through
+    a small, event-driven interface (junction gateway + demand pulse).
+    """
+
+    def __init__(self, graph: UrbanGraph, engine: VectorEngine):
+        self.graph = graph
+        self.engine = engine
         self.time_of_day = 6.0
         self.demand = 0.2
-        self._next_capsule_id = 0
         self._spawn_cooldown = 0.0
 
-    # ------------------------------------------------------ demand schedule
+    # ---------------------------------------------------------- demand pulse
 
     def update_schedule(self, mode: str, dt_hours: float) -> float:
         self.time_of_day = (self.time_of_day + dt_hours) % 24.0
         h = self.time_of_day
         if mode == "CLASSIC":
             self.demand = 1.0 if 8.0 <= h <= 9.0 else 0.1
-        else:  # DECENTRALIZED
+        else:
             if   7.0 <= h <= 8.0:   self.demand = 0.4
             elif 8.5 <= h <= 9.5:   self.demand = 0.5
             elif 10.0 <= h <= 11.0: self.demand = 0.3
@@ -551,180 +568,363 @@ class CentralAI:
     def fleet_target(self) -> int:
         return max(2, int(self.demand * 30))
 
-    # ---------------------------------------------------- route generation
+    def recommended_speed(self, active: int) -> float:
+        return 4.5 if active <= 15 else 2.5
 
-    def plan_route(self, src_node: int, dst_node: int) -> Optional[List[int]]:
-        """Strategic routing: uses NetworkX shortest_path on the road graph."""
-        try:
-            return nx.shortest_path(self.graph.graph, src_node, dst_node)
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return None
-
-    def plan_route_from_edge(self, edge: Tuple[int, int],
-                             dst_node: int) -> Optional[List[int]]:
-        """Plan a route beginning at the endpoint of the capsule's edge."""
-        return self.plan_route(edge[1], dst_node)
-
-    def choose_random_destination(self) -> int:
-        nodes = list(self.graph.graph.nodes)
-        return random.choice(nodes)
-
-    def pick_spawn_station(self) -> int:
-        """Choose the least-loaded station as spawn depot."""
-        stations = self.graph.stations
-        return min(stations.keys(),
-                   key=lambda nid: stations[nid].load_factor())
-
-    def pick_swap_station(self, capsule: Capsule) -> Optional[int]:
-        """Pick the least-loaded station, considering distance."""
-        if not self.graph.stations:
-            return None
-        best_nid, best_score = None, float("inf")
-        for nid, st in self.graph.stations.items():
-            try:
-                path = nx.shortest_path(self.graph.graph, capsule.current_edge[1], nid)
-                dist = len(path)
-            except (nx.NetworkXNoPath, nx.NodeNotFound, TypeError):
-                dist = 1000
-            score = st.load_factor() + 0.05 * dist
-            if score < best_score:
-                best_score, best_nid = score, nid
-        return best_nid
-
-    def assign_swap(self, capsule: Capsule) -> None:
-        """Dynamically reroute a capsule to a swap station."""
-        if capsule.reserved_station is not None:
-            return
-        nid = self.pick_swap_station(capsule)
-        if nid is None or capsule.current_edge is None:
-            return
-        new_route = self.plan_route_from_edge(capsule.current_edge, nid)
-        if not new_route:
-            return
-        # Preserve current edge, replace the tail of the route
-        capsule.route = [capsule.current_edge[0]] + new_route
-        capsule.route_step = 0
-        capsule.reserved_station = nid
-        self.graph.stations[nid].request_swap(capsule)
-
-    # -------------------------------------------------------- fleet control
-
-    def maybe_spawn(self, capsules: List[Capsule]) -> Optional[Capsule]:
-        """Spawn a new capsule at the least-loaded station depot."""
-        if self._spawn_cooldown > 0:
-            return None
-        nid = self.pick_spawn_station()
-        st = self.graph.stations[nid]
-        dst = self.choose_random_destination()
-        route = self.plan_route(nid, dst)
-        if not route or len(route) < 2:
-            return None
-        spawn_edge = (route[0], route[1])
-        x, y = self.graph.node_xy(nid)
-        cap = Capsule(self._next_capsule_id, x, y, route, spawn_edge)
-        self._next_capsule_id += 1
-        self._spawn_cooldown = 0.25
-        return cap
-
-    def tick_spawn_cooldown(self, dt: float) -> None:
+    def tick(self, dt: float) -> None:
         self._spawn_cooldown = max(0.0, self._spawn_cooldown - dt)
 
-    def recommend_speed(self, active_count: int) -> float:
-        return 4.5 if active_count <= 15 else 2.5
+    # ------------------------------------------------------------ spawn fleet
+
+    def maybe_spawn(self) -> bool:
+        if self._spawn_cooldown > 0:
+            return False
+        # Choose least-loaded station as depot
+        st_nodes = self.graph.station_node_list()
+        if not st_nodes:
+            return False
+        best = min(st_nodes, key=lambda n: self.graph.station_nodes[n].load_factor())
+        # Spawn on one of the outgoing edges of that station node
+        outgoing = [eid for eid, (u, v) in enumerate(self.graph.edges) if u == best]
+        if not outgoing:
+            return False
+        eid = random.choice(outgoing)
+        row = self.engine.next_free_row
+        # Find next free row (bounded, initialization-time only)
+        inactive = np.flatnonzero(self.engine.active_mask == 0)
+        if inactive.size == 0:
+            return False
+        row = int(inactive[0])
+        self.engine.activate_row(row, eid, wp_start=0)
+        # Random destination node
+        self.engine.dest_node[row] = random.choice(list(self.graph.graph.nodes))
+        self.engine.next_free_row = row + 1
+        self._spawn_cooldown = 0.25
+        return True
+
+    # ---------------------------------------------------------- junction gate
+
+    def process_junctions(self, emergency: bool) -> None:
+        """
+        Vectorized junction event gateway.
+
+        Detects rows whose wp_idx has overflowed their current edge's
+        waypoint count, freezes speed, and rewrites their edge_idx to the
+        next segment in their route. Route recomputation uses NetworkX.
+        """
+        eng = self.engine
+        act = eng.active_mask.astype(bool)
+        if not np.any(act):
+            return
+
+        max_wp = eng.edge_wp_count[eng.edge_idx]
+        at_junction = act & (eng.wp_idx >= max_wp)
+        if not np.any(at_junction):
+            return
+
+        # Freeze speed for rows at junction
+        eng.speed[at_junction] = 0.0
+
+        # Enumerate the (usually small) set of junction rows
+        rows = np.flatnonzero(at_junction)
+        for row in rows:
+            self._resolve_junction(int(row), emergency)
+
+    def _resolve_junction(self, row: int, emergency: bool) -> None:
+        """Per-junction route resolution. Small population, called rarely."""
+        eng = self.engine
+        cur_eid = int(eng.edge_idx[row])
+        u, v = self.graph.edges[cur_eid]
+
+        # Determine the strategic destination for this capsule
+        if eng.needs_swap[row] == 1:
+            # Dynamic swap routing: reroute to the least-loaded station
+            dest = self._pick_swap_station_node()
+            eng.reserved_station[row] = dest
+        else:
+            dest = int(eng.dest_node[row])
+            if dest < 0 or dest == v:
+                # Assign a new random destination and continue
+                dest = random.choice(list(self.graph.graph.nodes))
+                eng.dest_node[row] = dest
+
+        # Plan the next hop using NetworkX shortest_path
+        try:
+            path = nx.shortest_path(self.graph.graph, v, dest, weight=None)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            path = None
+
+        if not path or len(path) < 2:
+            # No route: pick a random outgoing edge as a fallback
+            outgoing = [eid for eid, (a, b) in enumerate(self.graph.edges) if a == v]
+            if not outgoing:
+                eng.deactivate_row(row)
+                return
+            new_eid = random.choice(outgoing)
+        else:
+            new_eid = self.graph.edge_id(path[0], path[1])
+            if new_eid is None:
+                eng.deactivate_row(row)
+                return
+
+        # Rewrite state matrix in O(1)
+        eng.edge_idx[row] = new_eid
+        eng.wp_idx[row] = 0
+        # Snap position to the new edge start
+        x0, y0 = self.graph.edge_waypoints[new_eid][0]
+        eng.x[row] = x0
+        eng.y[row] = y0
+
+    def _pick_swap_station_node(self) -> int:
+        """Pick the station node with the lowest current load factor."""
+        nodes = self.graph.station_node_list()
+        return min(nodes, key=lambda n: self.graph.station_nodes[n].load_factor())
+
+    # ------------------------------------------------------- station serving
+
+    def serve_stations(self, dt: float) -> None:
+        """
+        Admit WAITING rows to stations with free slots and available packs,
+        and advance recharge timers.
+        """
+        eng = self.engine
+        for st in self.graph.station_nodes.values():
+            st.update(dt)
+            if st.active_slots >= MAX_STATION_SLOTS or st.available_batteries <= 0:
+                continue
+            # Vectorized selection: WAITING rows whose reserved_station matches
+            waiting = (eng.active_mask.astype(bool)
+                       & (eng.status == ST_WAITING)
+                       & (eng.reserved_station == st.node_id))
+            rows = np.flatnonzero(waiting)
+            free_bays = MAX_STATION_SLOTS - st.active_slots
+            take = rows[:min(free_bays, st.available_batteries)]
+            if take.size == 0:
+                continue
+            eng.status[take] = ST_SWAPPING
+            eng.swap_timer[take] = SWAP_DURATION_TICKS
+            eng.speed[take] = 0.0
+            st.active_slots += take.size
+            st.available_batteries -= take.size
+            for _ in take:
+                st.recharging.append(STATION_RECHARGE_SEC)
+
+    def flag_waiting_at_stations(self) -> None:
+        """
+        Vectorized: rows that reached their reserved station become WAITING.
+        """
+        eng = self.engine
+        act = eng.active_mask.astype(bool)
+        # Only rows whose current edge ends at their reserved station
+        for st_node, st in self.graph.station_nodes.items():
+            ending_here = np.array(
+                [self.graph.edges[e][1] == st_node for e in range(len(self.graph.edges))],
+                dtype=bool
+            ) if len(self.graph.edges) < 200 else None  # small graph: cheap mask
+
+            if ending_here is None:
+                continue
+            on_edge = ending_here[eng.edge_idx]
+            near_end = eng.wp_idx >= (eng.edge_wp_count[eng.edge_idx] - 1)
+            ready = (act
+                     & (eng.reserved_station == st_node)
+                     & on_edge
+                     & near_end
+                     & (eng.status == ST_OPERATIONAL))
+            rows = np.flatnonzero(ready)
+            if rows.size == 0:
+                continue
+            eng.status[rows] = ST_WAITING
+            eng.speed[rows] = 0.0
+            st.queue_count += rows.size
+
+    def refresh_station_queues(self) -> None:
+        """Recompute station queue counters from engine state."""
+        eng = self.engine
+        for st_node, st in self.graph.station_nodes.items():
+            st.queue_count = int(np.sum(
+                (eng.active_mask.astype(bool))
+                & (eng.status == ST_WAITING)
+                & (eng.reserved_station == st_node)
+            ))
+
+    def demote_surplus(self, target: int) -> None:
+        """Vectorized: demote surplus OPERATIONAL rows to IDLE."""
+        eng = self.engine
+        act = eng.active_mask.astype(bool)
+        op = act & (eng.status == ST_OPERATIONAL)
+        count = int(op.sum())
+        if count <= target:
+            return
+        excess = count - target
+        rows = np.flatnonzero(op)[:excess]
+        eng.status[rows] = ST_IDLE
+
+    def trigger_random_failures(self, p: float = 2.0e-5) -> None:
+        eng = self.engine
+        act = eng.active_mask.astype(bool)
+        draw = eng.rng.random(MAX_CAPSULES) < p
+        rows = np.flatnonzero(act & draw & (eng.status != ST_BROKEN))
+        if rows.size:
+            eng.status[rows] = ST_BROKEN
+            eng.speed[rows] = 0.0
 
 
 # ===========================================================================
-# LAYER 4 — VISUALIZER + MAIN LOOP
+# LAYER 4 — RENDERER (bulk blitting)
 # ===========================================================================
 
-def draw_graph(screen: pygame.Surface, graph: UrbanGraph) -> None:
-    # Edges as thick tape lines
-    for (u, v), tape in graph.edge_tapes.items():
-        pts = [(int(x), int(y)) for x, y in tape.waypoints[::2]]
-        if len(pts) >= 2:
-            pygame.draw.lines(screen, COLOR_TAPE, False, pts, 3)
+class Renderer:
+    """High-throughput Pygame renderer using cached sprites + bulk blits."""
 
-    # Nodes
-    for nid in graph.graph.nodes:
-        x, y = graph.node_xy(nid)
-        pygame.draw.circle(screen, COLOR_NODE, (int(x), int(y)), 3)
+    def __init__(self, screen: pygame.Surface, graph: UrbanGraph):
+        self.screen = screen
+        self.graph = graph
 
-    # Stations as distinct hubs
-    for nid, st in graph.stations.items():
-        x, y = graph.node_xy(nid)
-        pygame.draw.circle(screen, COLOR_STATION, (int(x), int(y)), 12)
-        pygame.draw.circle(screen, (255, 255, 255), (int(x), int(y)), 12, 2)
-        font = pygame.font.SysFont("consolas", 14)
-        label = font.render(
-            f"Q{len(st.queue)} P{st.available_batteries}",
-            True, (255, 255, 255)
-        )
-        screen.blit(label, (x - 22, y + 16))
+        # Cached 4x4 dot sprites keyed by status
+        self.sprites: Dict[int, pygame.Surface] = {}
+        self._build_sprites()
+
+        # Pre-render the static tape graph once onto a background surface
+        self.static_bg = pygame.Surface((WIDTH, HEIGHT))
+        self.static_bg.fill(COLOR_BG)
+        self._draw_static_graph(self.static_bg)
+
+    def _build_sprites(self) -> None:
+        palette = {
+            ST_OPERATIONAL: COLOR_CAPSULE,
+            ST_IDLE:        COLOR_IDLE,
+            ST_WAITING:     COLOR_WAITING,
+            ST_SWAPPING:    COLOR_SWAPPING,
+            ST_BROKEN:      COLOR_BROKEN,
+            ST_EMERGENCY:   COLOR_BROKEN,
+        }
+        for code, col in palette.items():
+            surf = pygame.Surface((6, 6), pygame.SRCALPHA)
+            pygame.draw.circle(surf, col, (3, 3), 3)
+            self.sprites[code] = surf
+
+    def _draw_static_graph(self, surface: pygame.Surface) -> None:
+        # Edges as thick tape lines
+        for wp in self.graph.edge_waypoints:
+            pts = [(int(p[0]), int(p[1])) for p in wp[::3]]
+            if len(pts) >= 2:
+                pygame.draw.lines(surface, COLOR_TAPE, False, pts, 3)
+        # Nodes
+        for nid in self.graph.graph.nodes:
+            x, y = self.graph.node_xy(nid)
+            pygame.draw.circle(surface, COLOR_NODE, (int(x), int(y)), 3)
+        # Stations
+        for nid, st in self.graph.station_nodes.items():
+            x, y = self.graph.node_xy(nid)
+            pygame.draw.circle(surface, COLOR_STATION, (int(x), int(y)), 12)
+            pygame.draw.circle(surface, (255, 255, 255), (int(x), int(y)), 12, 2)
+
+    def draw(self, engine: VectorEngine) -> None:
+        # Blit static background (graph + tape)
+        self.screen.blit(self.static_bg, (0, 0))
+
+        # Extract active slices in one vectorized pass
+        x, y, status = engine.active_xy_status()
+        if x.size == 0:
+            return
+
+        # Cast to ints; build blit list grouped by status so we use one
+        # bulk screen.blits() call per status group (few calls total).
+        xi = x.astype(np.int32)
+        yi = y.astype(np.int32)
+
+        blit_seq = []
+        for code, sprite in self.sprites.items():
+            sel = status == code
+            if not np.any(sel):
+                continue
+            xs = xi[sel] - 3
+            ys = yi[sel] - 3
+            # Zip into the (surface, dest) tuples pygame.blits expects
+            blit_seq.extend(zip([sprite] * xs.size,
+                                zip(xs.tolist(), ys.tolist())))
+        if blit_seq:
+            self.screen.blits(blit_seq, doreturn=False)
+
+    # --------------------------------------------------------------- HUD
+
+    def draw_hud(self, central: CentralAI, engine: VectorEngine,
+                 target: int, emergency: bool) -> None:
+        font = pygame.font.SysFont("consolas", 16)
+        h = central.time_of_day
+        hh, mm = int(h), int((h - int(h)) * 60)
+
+        active = engine.active_count()
+        idle = int(np.sum((engine.active_mask.astype(bool))
+                          & (engine.status == ST_IDLE)))
+        waiting = int(np.sum((engine.active_mask.astype(bool))
+                             & (engine.status == ST_WAITING)))
+        swap = int(np.sum((engine.active_mask.astype(bool))
+                          & (engine.status == ST_SWAPPING)))
+        broken = int(np.sum((engine.active_mask.astype(bool))
+                            & (engine.status == ST_BROKEN)))
+
+        lines = [
+            (f"CapsuleNet | {hh:02d}:{mm:02d} | Mode {SCHEDULING_MODE}"
+             f" | Demand {central.demand:.2f}", COLOR_HUD),
+            (f"Fleet {active:>5} / target {target:>5} | "
+             f"idle {idle:>5} | waiting {waiting:>4} | swap {swap:>4} | broken {broken:>3}",
+             COLOR_HUD),
+            ("Press [SPACE] to toggle city-wide emergency stop",
+             COLOR_HUD_ALERT if emergency else COLOR_HUD),
+        ]
+        y = 12
+        for text, col in lines:
+            self.screen.blit(font.render(text, True, col), (16, y))
+            y += 22
+
+        # Station matrix
+        for nid, st in self.graph.station_nodes.items():
+            text = (f"  Station {nid:>3} | packs {st.available_batteries:>2}/"
+                    f"{st.capacity} | queue {st.queue_count:>3} | "
+                    f"bays {st.active_slots}/{MAX_STATION_SLOTS}")
+            self.screen.blit(font.render(text, True, COLOR_STATION), (16, y))
+            y += 20
 
 
-def draw_hud(screen: pygame.Surface,
-             ai: CentralAI,
-             capsules: List[Capsule],
-             target: int,
-             emergency: bool) -> None:
-    font = pygame.font.SysFont("consolas", 16)
-    h = ai.time_of_day
-    hh, mm = int(h), int((h - int(h)) * 60)
-
-    idle    = sum(1 for c in capsules if c.status == Capsule.IDLE)
-    waiting = sum(1 for c in capsules if c.status == Capsule.WAITING)
-    swap    = sum(1 for c in capsules if c.status == Capsule.SWAPPING)
-    broken  = sum(1 for c in capsules if c.status == Capsule.BROKEN)
-
-    lines = [
-        f"CapsuleNet | {hh:02d}:{mm:02d} | Mode {SCHEDULING_MODE} | Demand {ai.demand:.2f}",
-        f"Fleet: {len(capsules):>3} / target {target:>3} | "
-        f"idle {idle} | waiting {waiting} | swap {swap} | broken {broken}",
-        "Press [SPACE] to toggle city-wide emergency stop",
-    ]
-    colors = [COLOR_HUD, COLOR_HUD, COLOR_HUD_ALERT if emergency else COLOR_HUD]
-
-    y = 12
-    for text, color in zip(lines, colors):
-        screen.blit(font.render(text, True, color), (16, y))
-        y += 22
-
-    # Station matrix
-    station_lines = []
-    for nid, st in ai.graph.stations.items():
-        station_lines.append(
-            f"  Station {nid:>3}: packs {st.available_batteries:>2}/{st.capacity}"
-            f" | queue {len(st.queue):>2} | bays {st.active_slots}/{MAX_STATION_SLOTS}"
-        )
-    for text in station_lines:
-        screen.blit(font.render(text, True, COLOR_STATION), (16, y))
-        y += 20
-
+# ===========================================================================
+# MAIN
+# ===========================================================================
 
 def main() -> None:
-    global CAPSULE_WORLD
-
     pygame.init()
-    pygame.display.set_caption("CapsuleNet — NetworkX Urban Transit Simulation")
+    pygame.display.set_caption("CapsuleNet — DOD Vectorized Transit Simulation")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     clock = pygame.time.Clock()
 
-    # ---- Infrastructure ----
+    # Infrastructure
     graph = UrbanGraph()
-    CAPSULE_WORLD = graph
+    # Physics / state matrix
+    engine = VectorEngine(graph)
+    # Strategic intelligence
+    central = CentralAI(graph, engine)
+    # Renderer
+    renderer = Renderer(screen, graph)
 
-    # ---- Intelligence ----
-    central = CentralAI(graph)
-
-    # ---- Active fleet ----
-    capsules: List[Capsule] = []
+    # Initialize the first INITIAL_ACTIVE rows at stations
+    station_nodes = graph.station_node_list()
+    for i in range(INITIAL_ACTIVE):
+        st_node = random.choice(station_nodes)
+        outgoing = [eid for eid, (u, v) in enumerate(graph.edges) if u == st_node]
+        if not outgoing:
+            continue
+        eid = random.choice(outgoing)
+        engine.activate_row(i, eid, wp_start=0)
+        engine.dest_node[i] = random.choice(list(graph.graph.nodes))
+    engine.next_free_row = INITIAL_ACTIVE
 
     emergency = False
     dt_seconds = 1.0 / FPS
     running = True
 
     while running:
-        # ---- Events ---------------------------------------------------------
+        # ---- Events -------------------------------------------------------
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -733,85 +933,52 @@ def main() -> None:
                     running = False
                 elif event.key == pygame.K_SPACE:
                     emergency = not emergency
+                    if emergency:
+                        eng = engine
+                        act = eng.active_mask.astype(bool)
+                        eng.status[act] = ST_EMERGENCY
+                        eng.target[act] = 0.0
+                    else:
+                        eng = engine
+                        em = eng.active_mask.astype(bool) & (eng.status == ST_EMERGENCY)
+                        eng.status[em] = ST_OPERATIONAL
 
-        # ---- Central AI: schedule, fleet size, speeds -----------------------
+        # ---- Central AI (strategic) ---------------------------------------
         central.update_schedule(SCHEDULING_MODE, dt_seconds * 0.6)
-        central.tick_spawn_cooldown(dt_seconds)
-        target_count = central.fleet_target()
+        central.tick(dt_seconds)
 
-        # Spawn new capsules ONLY at stations, only via CentralAI
-        if len(capsules) < target_count:
-            new_cap = central.maybe_spawn(capsules)
-            if new_cap is not None:
-                capsules.append(new_cap)
+        target_fleet = central.fleet_target()
+        current_active = engine.active_count()
 
-        # Surplus fleet -> demote to IDLE (they finish their loop, then dock)
-        elif len(capsules) > target_count:
-            for cap in capsules:
-                if cap.status == Capsule.OPERATIONAL and not cap.needs_swap:
-                    cap.status = Capsule.IDLE
-                    break
+        # Spawn new rows via CentralAI (bounded, at most 1 per frame)
+        if current_active < target_fleet:
+            central.maybe_spawn()
 
-        # ---- Stations tick --------------------------------------------------
-        for st in graph.stations.values():
-            st.update(dt_seconds)
+        # Demote surplus rows (vectorized)
+        central.demote_surplus(target_fleet)
 
-        # ---- Random hardware failures --------------------------------------
-        if capsules and random.random() < 0.002:
-            unlucky = random.choice(capsules)
-            if unlucky.status not in (Capsule.BROKEN, Capsule.SWAPPING):
-                unlucky.is_broken = True
+        # Random hardware failures (vectorized)
+        central.trigger_random_failures()
 
-        # ---- Central speed broadcast ---------------------------------------
-        central_signals = {
-            "recommended_speed": central.recommend_speed(len(capsules)),
+        # ---- Central speed broadcast --------------------------------------
+        signals = {
+            "recommended_speed": central.recommended_speed(engine.active_count()),
         }
 
-        # ---- Dynamic swap routing (CentralAI-only strategic move) ----------
-        for cap in capsules:
-            if cap.needs_swap and cap.reserved_station is None \
-               and cap.status == Capsule.OPERATIONAL \
-               and not cap.is_broken:
-                central.assign_swap(cap)
+        # ---- Vectorized physics tick --------------------------------------
+        engine.step(signals, dt=1.0)
 
-        # ---- Arrival at reserved station -> enter WAITING queue ------------
-        for cap in capsules:
-            if cap.reserved_station is None:
-                continue
-            sx, sy = graph.node_xy(cap.reserved_station)
-            if math.hypot(cap.x - sx, cap.y - sy) < 20 \
-               and cap.status == Capsule.OPERATIONAL:
-                cap.status = Capsule.WAITING
-                cap.speed = 0.0
+        # ---- Junction gateway (route resolution, mostly idle) -------------
+        central.process_junctions(emergency)
 
-        # ---- Stations serve their queues -----------------------------------
-        for st in graph.stations.values():
-            st.try_serve(dt_seconds)
+        # ---- Station macro logic ------------------------------------------
+        central.refresh_station_queues()
+        central.flag_waiting_at_stations()
+        central.serve_stations(dt_seconds)
 
-        # ---- Render ---------------------------------------------------------
-        screen.fill(COLOR_BG)
-        draw_graph(screen, graph)
-
-        # Update and draw capsules
-        for i, cap in enumerate(capsules):
-            cap.update(central_signals, emergency, capsules, graph, dt_seconds)
-            cap.draw(screen, highlight=(i == 0))
-
-        # ---- Park IDLE capsules once they reach a station node -------------
-        to_park = []
-        for cap in capsules:
-            if cap.status == Capsule.IDLE and cap.current_edge is not None:
-                u, v = cap.current_edge
-                for nid in (u, v):
-                    sx, sy = graph.node_xy(nid)
-                    if math.hypot(cap.x - sx, cap.y - sy) < 18:
-                        to_park.append(cap)
-                        break
-        for cap in to_park:
-            capsules.remove(cap)
-
-        # ---- HUD ------------------------------------------------------------
-        draw_hud(screen, central, capsules, target_count, emergency)
+        # ---- Render --------------------------------------------------------
+        renderer.draw(engine)
+        renderer.draw_hud(central, engine, target_fleet, emergency)
 
         pygame.display.flip()
         clock.tick(FPS)
